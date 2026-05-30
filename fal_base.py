@@ -135,6 +135,17 @@ class FalMeshBackend:
         self._log(f"downloading GLB -> {output_glb_path}")
         self._download(glb_url, output_glb_path)
 
+        # fal mesh backends (Pixal3D, etc.) return EXT_texture_webp GLBs that
+        # Houdini's glTF loader rejects. Convert webp textures -> png in place
+        # (no-op for GLBs that don't use webp, e.g. some Trellis outputs).
+        try:
+            import glb_webp_to_png
+            if glb_webp_to_png.convert(output_glb_path, verbose=verbose):
+                self._log("converted webp textures -> png")
+        except Exception as e:
+            self._log(f"WARNING: webp->png conversion failed ({e}); "
+                      f"GLB may not load in Houdini")
+
         return {
             "request_id": result.get("request_id", ""),
             "glb_path": output_glb_path,

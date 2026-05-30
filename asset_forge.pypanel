@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <interface name="asset_forge_layout" label="Asset Forge · Layout" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[
+import sys
+# TODO: this dir is already on PYTHONPATH via houdini.env — drop the hardcoded
+# path and just `import asset_forge_ui` (or read $ASSET_FORGE_TOOLS). See dev_log.
+TOOLS_DIR = "/home/maxborg/Projects/asset-forge-tools"
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+import asset_forge_ui
+
+
+def createInterface():
+    return asset_forge_ui.create_layout_interface()
+]]></script>
+    <includeInPaneTabMenu menu_position="300" create_separator="false"/>
+    <includeInToolbarMenu menu_position="300" create_separator="false"/>
+    <help><![CDATA[Asset Forge — Layout stage controls.]]></help>
+  </interface>
+  <interface name="asset_forge_assets" label="Asset Forge · Assets" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[
+import sys
+# TODO: this dir is already on PYTHONPATH via houdini.env — drop the hardcoded
+# path and just `import asset_forge_ui` (or read $ASSET_FORGE_TOOLS). See dev_log.
+TOOLS_DIR = "/home/maxborg/Projects/asset-forge-tools"
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+import asset_forge_ui
+
+
+def createInterface():
+    return asset_forge_ui.create_assets_interface()
+]]></script>
+    <includeInPaneTabMenu menu_position="301" create_separator="false"/>
+    <includeInToolbarMenu menu_position="301" create_separator="false"/>
+    <help><![CDATA[Asset Forge — per-asset stage (cards + results picker).]]></help>
+  </interface>
+</pythonPanelDocument>

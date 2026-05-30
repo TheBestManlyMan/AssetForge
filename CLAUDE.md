@@ -61,14 +61,26 @@ Existing backend clients:
   aspect_ratio=None, verbose=True) -> {"model", "image_path"}`. stdlib-only.
 - `fal_base.py` — `FalMeshBackend` shared base for fal.ai image-to-3D
   backends. Handles FAL_KEY check, `fal_client.upload_file`,
-  `fal_client.subscribe`, and GLB download. Subclasses set `MODEL_ID`,
-  `OUTPUT_KEY`, `TAG`, and `default_args()`. Uses pip `fal-client` (see §3).
+  `fal_client.subscribe`, GLB download, and an automatic `glb_webp_to_png`
+  conversion right after download (so Pixal3D/Trellis webp GLBs load in
+  Houdini). Subclasses set `MODEL_ID`, `OUTPUT_KEY`, `TAG`, and
+  `default_args()`. Uses pip `fal-client` (see §3).
 - `trellis_client.py` — fal-ai/trellis-2. Params: `resolution`
   (512/1024/1536), `texture_size` (1024/2048/4096). Entry:
   `generate_3d(image_path, output_glb_path, **params) -> {"request_id",
   "glb_path", "result"}`.
 - `pixal3d_client.py` — fal-ai/pixal3d. Params: `resolution` (1024/1536),
   `texture_size` (1024/2048/4096). Same `generate_3d(...)` shape as Trellis.
+- `glb_extract.py` — pulls embedded textures out of a GLB into a `textures/`
+  dir (maps images → albedo/normal/roughness/metallic/… slots via material
+  assignments, splits packed metallic-roughness). stdlib + PIL.
+- `glb_webp_to_png.py` — converts `EXT_texture_webp` GLBs (Pixal3D / some
+  Trellis) to plain PNG glTF **in place**: ffmpeg-converts each webp image,
+  rebuilds the binary buffer with recomputed 4-byte-aligned bufferView offsets,
+  repoints `texture.source`, drops the extension declarations. Entry
+  `convert(glb_path, verbose=True) -> bool` (no-op → False for non-webp GLBs).
+  Called automatically by `fal_base` after every download. stdlib + ffmpeg
+  subprocess (PIL has no webp in Houdini's Python).
 
 Note: fal mesh-gen clients expose `generate_3d(...)` rather than
 `generate(...)` — they return a dict (request_id + glb_path + raw result),
@@ -86,54 +98,74 @@ is on, use `gemini-2.5-flash-image`. Swap the `MODEL` constant to flip.
 ## Per-asset folder layout
 
 ```
-.../asset_forge/v001/
+.../<collection>/v001/              ← <collection> = HDA instance name ($OS), see Multi-instance
 ├── layout/assets.json              ← one entry per asset
-├── assets/asset_001/
+├── assets/<asset_name>/            ← folder named after the asset, NOT asset_001
 │   ├── data.json                   ← prompt + metadata
 │   ├── preview.jpg                 ← isolated placeholder render (style ref)
 │   ├── generated.png               ← styled image (image gen output)
-│   ├── mesh.glb                    ← raw image-to-3D output
+│   ├── mesh.glb                    ← image-to-3D output (webp→png converted)
+│   ├── textures/                   ← extracted PBR maps (albedo/normal/rough/metal/…)
+│   ├── contactsheet.png            ← preview | generated | render contact sheet
 │   ├── aligned.bgeo.sc             ← fitted + transformed to placeholder
 │   ├── proxy.bgeo.sc               ← decimated
-│   └── asset.usd                   ← per-asset deliverable
-└── final/scene.usd                 ← master, references all assets
+│   └── <asset_name>.usd            ← per-asset deliverable
+└── Scene/assets.usd                ← master, references all assets
 ```
+
+Folder + file paths are authored by the **Resolver** node as a standardized
+`path_*` attribute set — see the node graph below. The per-asset folder is the
+sanitized asset *name* (de-duplicated), not `asset_001` (that stays as `@id`).
 
 ## Node graph (current → planned)
 
 ```
-Layout Export (Python SOP)        → assets.json                 [DONE]
+Create_JSON (Python SOP)          → assets.json                 [DONE]
   ↓
 load_assets (JSON Input TOP)      → one work item per asset     [DONE]
   ↓
-expand_asset_dir (attrib create)  → asset_dir made absolute     [DONE]
+Resolver (pythonprocessor)        → expands $HIP + authors the   [DONE]
+  standardized path_* attrib set from ONE ARTIFACTS dict:
+  path_data / path_preview / path_generated / path_render /
+  path_mesh / path_tex_dir / path_asset_usd / path_proxy /
+  path_aligned / path_contactsheet (+ name_safe). SINGLE SOURCE OF
+  TRUTH for paths — downstream reads @path_* instead of re-joining
+  strings. Replaced the old expand_asset_dir attribcreate. To add a
+  pipeline path, add one line to ARTIFACTS.
   ↓
-OpenGL_Fetch (ropfetch)           → preview.jpg                 [DONE]
+OpenGL_Fetch (ropfetch)           → preview.jpg  (picture=@path_preview) [DONE]
   ↓
-Preview_OpenGL_mplay              → opens preview.jpg in mplay  [DONE]
-  ↓
-Keywords_From_HDA (pythonprocessor) → @place, @year (+ any     [DONE]
-                                      keys in HDA keywords dict)
-  ↓
-Prompt_Build (pythonprocessor)    → @prompt per asset           [DONE]
+Keywords_From_HDA → LLM_Prompt_Build → @prompt per asset        [DONE]
   (LLM off: resolves @attrs in prompt_template directly)
   (LLM on:  sends name+keywords to Gemini, falls back to template)
   ↓
 Image_Gen (pythonprocessor)       → generated.png               [DONE]
   ↓
-Preview_Gen_mplay                 → opens generated.png in mplay [DONE]
+{ PIXAL_Mesh_Gen | Meshy_Mesh_Gen } → mesh.glb                  [DONE]
+  Two backend branches selected by switch2. Meshy uses submit-all
+  then poll_all() in one shared loop (parallel). fal_base converts
+  webp→png on download.
   ↓
-Mesh_Gen (pythonprocessor)        → mesh.glb                    [BUILDING]
-  (submit all assets first, then poll_all in shared loop)
+Extract_Textures_{Pixal | Meshy}  → textures/                   [DONE]
+  (one per branch; reads @path_mesh, writes @path_tex_dir)
   ↓
-Mesh Import + Reapply (SOP)       → aligned.bgeo.sc             [TODO]
+Save_USD (ropfetch)               → <name>.usd (lopoutput=@path_asset_usd) [DONE]
   ↓
-Proxy Gen                         → proxy.bgeo.sc               [TODO]
+Render_Generated (ropfetch)       → render.jpg (@path_render)   [DONE]
   ↓
-Per-Asset USD                     → asset.usd                   [TODO]
+Render_ContactSheet (ropfetch)    → contactsheet.png (@path_contactsheet) [DONE]
   ↓
-Waitfor All → Scene Assembly      → scene.usd                   [TODO]
+Wait_All_Per_Asset → Build_Scene_Refs → Save_Scene_USD → Scene/assets.usd [DONE]
+
+Still planned: mesh import + transform reapply (aligned.bgeo.sc),
+proxy gen (proxy.bgeo.sc), and a backend-picker parm to replace the
+two-node + switch2 setup.
 ```
+
+All `path_*` attribs propagate downstream because Image_Gen, both mesh nodes,
+and the texture nodes run a generic `_forward(src, dst)` loop (copies all
+String/Int/Float attribs) — without it the manually-set attribs would drop the
+`path_*` set after Image_Gen.
 
 ## HDA parms (asset_forge node)
 
@@ -141,11 +173,38 @@ Waitfor All → Scene Assembly      → scene.usd                   [TODO]
 |------|------|---------|
 | `assets` | string | Path to Assets_Pre geo node |
 | `camera` | string | Scene camera path |
+| `collection` | string | Output collection folder under `$HIP` → `$HIP/<collection>/vNNN/`. Default expr `$OS` (the HDA instance name). Currently a **spare parm on the instance** (adding it to the definition over MCP crashes Houdini); promote in Type Properties to make it standard. |
+| `version` | int | Pipeline version → `vNNN` folder segment. Read instance-relative everywhere (never via `/obj/asset_forge`). |
 | `keywords` | dict | Scene context fed to all work items — add keys freely, they become `@attrs` |
 | `prompt_template` | multiline string | Direct image gen prompt with `@attr` placeholders. Used when LLM is off, also the fallback when LLM fails |
 | `use_llm` | toggle | On: Gemini writes the prompt from name+keywords. Off: template used directly |
 | `llm_model` | menu | Gemini model: `gemini-2.5-flash` / `gemini-2.5-pro` / `gemini-2.0-flash` |
 | `llm_prompt` | multiline string | The message sent to the LLM. Supports `@attr` substitution — any work item attrib can be inlined. Prompt_Build reads this with `unexpandedString()` + `_expand_attrs()`. |
+
+## Multi-instance (the HDA runs as several instances)
+
+The `asset_forge::1.0` HDA is instantiated multiple times (e.g. `asset_forge`,
+`asset_buildings`, `asset_bottles`), each with its own `collection`/`version`.
+So **nothing inside the HDA may hardcode `/obj/asset_forge`** or the literal
+`asset_forge` folder — that's the #1 bug when cloning an instance (it silently
+reads the *original's* version, paths, sub-nodes, and camera). Reference the
+containing instance relatively:
+
+- **String parms:** `` `chs("../../collection")` `` and
+  `` v`padzero(3, ch("../../version"))` `` (internal nodes sit 2 levels below
+  the HDA root).
+- **Python SOPs / scripts:** anchor by *type*, not by fixed depth —
+  `n = hou.pwd()` then `while not n.type().name().startswith("asset_forge"): n = n.parent()`.
+  (`hou.pwd().parent().parent()` works but breaks if the node is re-nested.)
+- **TOP cooktasks:** `self.topNode().parent().parent()`.
+- **LOP render camera:** `sceneimport.objects = ../../Scene_Cam` (import this
+  HDA's cam only) and
+  `` camera = `pythonexprs("'/' + hou.node('../..').name() + '/null1/Scene_Cam'")` ``
+  (the imported prim is `/<instance>/null1/Scene_Cam`).
+
+The `collection` parm (default `$OS`) drives the output root. **Adding a parm to
+the HDA *definition* over the live MCP bridge crashes Houdini** — add spare
+parms on the instance, or edit in Type Properties.
 
 ## Known gotchas (learned the hard way — don't repeat)
 
@@ -169,9 +228,10 @@ Waitfor All → Scene Assembly      → scene.usd                   [TODO]
 - `$HIP` inside a Python SOP parm is expanded by Houdini BEFORE the code runs.
   Build the literal at runtime via concatenation (`"$" + "HIP"`).
 - PDG does NOT expand `$HIP` inside attribute *values* across the `@attr`
-  substitution boundary. Expand explicitly with an attributecreate node using
-  `hou.text.expandString(pdg.workItem().stringAttribValue(...))` before any node
-  that uses the path. (This is what `expand_asset_dir` does.)
+  substitution boundary. Expand explicitly with `hou.text.expandString(...)`
+  before any node that uses the path. The **Resolver** pythonprocessor does this
+  once (expands `$HIP`, authors the absolute `path_*` set). It replaced the old
+  `expand_asset_dir` attribcreate.
 - `PackedFragment` has no `unpackGeometry()` / `embeddedGeometry()` in H21.0 —
   use `prim.boundingBox()` (inherited from `hou.Prim`).
 - JSON Input TOP's `prop` is JSON Pointer, NOT JSONPath. `assets` works,
@@ -204,14 +264,24 @@ Waitfor All → Scene Assembly      → scene.usd                   [TODO]
 - **PIL has no WebP support** in Houdini's bundled Python (compiled without
   libwebp). Use ffmpeg subprocess for WebP conversion instead.
   `glb_webp_to_png.py` handles this for GLB post-processing.
-- **Pixal3D GLBs use `EXT_texture_webp`** — Houdini can't load them without
-  conversion. `pixal3d_client.py` calls `glb_webp_to_png.convert()` automatically
-  after every download. To fix existing GLBs manually: import and call `convert(path)`.
+- **Pixal3D (and some Trellis) GLBs use `EXT_texture_webp`** — Houdini's glTF
+  loader rejects *any* GLB that lists an unsupported extension in
+  `extensionsRequired` ("unsupported extension EXT_texture_webp required by the
+  file"), so the whole **mesh** fails to import — not just textures. Fix:
+  `glb_webp_to_png.convert()` rewrites the GLB to PNG. It is wired into
+  **`fal_base.generate_3d()`** (after download), so **all** fal backends convert
+  automatically. ⚠️ This module went missing in the repo reorg and was
+  recreated 2026-05-26 — the call now lives in `fal_base`, **not**
+  `pixal3d_client` (older docs said otherwise). Fix existing GLBs manually with
+  `import glb_webp_to_png; glb_webp_to_png.convert(path)`. (Bonus: `glb_extract`
+  + the PIL metallic/roughness split also can't read webp, so converting first
+  fixes texture extraction too.)
 - **H21 ropfetch has no parm-override multiparm** — can't inject work item attrs
   into ROP parms (like `lopoutput`) natively. Workaround TBD for per-asset USD save.
-- When reloading a backend that imports another backend (e.g. `pixal3d_client`
-  imports `fal_base`), reload the dependency first:
-  `for m in ("fal_base", "pixal3d_client"): sys.modules.pop(m, None)`
+- When reloading a backend that imports another backend, reload dependencies
+  first. `pixal3d_client` imports `fal_base`, which now imports
+  `glb_webp_to_png`, so the order is:
+  `for m in ("glb_webp_to_png", "fal_base", "pixal3d_client"): sys.modules.pop(m, None)`
 
 ## Conventions for new nodes
 
@@ -223,6 +293,27 @@ Waitfor All → Scene Assembly      → scene.usd                   [TODO]
   blindly.
 - Make backend modules importable by adding their dir to `sys.path` explicitly
   inside the node. Don't assume PYTHONPATH.
+
+## UI (interactive control layer)
+
+`asset_forge_ui.py` (PySide6) + `asset_forge.pypanel` — a floating
+**[ Scene Viewer | Controls ]** panel opened by the HDA "Launch UI" button
+(`asset_forge_ui.launch(kwargs['node'])`). Phase 1 = the **Layout section**:
+live framing sliders bound to the `Layout_Null` orbit rig (Rotation→ry,
+Pitch→rx, Height→ty) + `Scene_Cam` (ortho) `orthowidth` (Distance); a "Render
+Layout Preview" button (renders `Layout_OpenGL` with a temporary literal
+`picture`, then restores `` `@path_previewlayout` ``); and a layout
+image-generation block (prompt ← HDA `layout_prompt`; **N sequential** Nano
+Banana re-rolls on a worker thread — Gemini has no seed/batch; candidates persist
+as `layout_gen_*.png` and reload on open; click-to-keep → `layout_generated.png`).
+
+Conventions: Houdini can't embed a live SceneViewer in a PySide panel → floating
+split panel (`createFloatingPanel` + `pane.splitHorizontally()` + a `.pypanel`
+interface whose script defines `createInterface()`). Network/render work runs off
+the GUI thread (QThread). Bind widgets to live node parms; compare nodes by
+`.path()`, not `is`. **Per-asset section** (mirror onto `Asset_Null`/`Asset_Cam`
++ `Centered`) is the next phase. Cam layout: `Scene_Cam` = ortho layout cam under
+`Layout_Null`; `Asset_Cam` under `Asset_Null`.
 
 ## Tech stack
 

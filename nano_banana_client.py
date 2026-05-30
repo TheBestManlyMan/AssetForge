@@ -110,7 +110,8 @@ def _post(url, body):
 # ---------------------------------------------------------------------------
 
 def generate_image(input_image_path, output_png_path, prompt,
-                   ref_image_path=None, aspect_ratio=None, verbose=True):
+                   ref_image_path=None, aspect_ratio=None, model=None,
+                   verbose=True):
     """
     End-to-end: preview image + prompt in, styled PNG on disk out.
 
@@ -119,10 +120,13 @@ def generate_image(input_image_path, output_png_path, prompt,
     prompt           : the LLM-refined generation prompt
     ref_image_path   : optional master style reference image
     aspect_ratio     : optional, e.g. "1:1", "16:9". Omit to let the model decide.
+    model            : Gemini image model id, e.g. "gemini-3-pro-image-preview"
+                       (Nano Banana Pro). Falls back to the module MODEL default.
 
     Returns:
         {"model": str, "image_path": str}
     """
+    use_model = model or MODEL
     def _log(msg):
         if verbose:
             print("[nano] " + msg)
@@ -147,9 +151,9 @@ def generate_image(input_image_path, output_png_path, prompt,
         "generationConfig": generation_config,
     }
 
-    url = API_BASE + "/models/" + MODEL + ":generateContent"
+    url = API_BASE + "/models/" + use_model + ":generateContent"
 
-    _log("submitting " + input_image_path)
+    _log("submitting " + input_image_path + " via " + use_model)
     resp = _post(url, body)
 
     # Find the first inline image in the response and write it out
@@ -163,7 +167,7 @@ def generate_image(input_image_path, output_png_path, prompt,
                 with open(output_png_path, "wb") as out:
                     out.write(base64.b64decode(inline["data"]))
                 _log("wrote " + output_png_path)
-                return {"model": MODEL, "image_path": output_png_path}
+                return {"model": use_model, "image_path": output_png_path}
 
     # No image came back -- surface any text returned to help debug
     raise RuntimeError(
