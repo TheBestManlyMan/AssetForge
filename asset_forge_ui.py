@@ -25,6 +25,7 @@ asset_forge_ui.launch(kwargs['node'])``) or the Python Shell
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -47,6 +48,46 @@ if TOOLS_DIR not in sys.path:
 # Path of the instance the most recent launch targeted — read by the panel
 # factories when the Python Panel system instantiates a stage widget.
 _ACTIVE_INSTANCE: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# Logging — Generate / Render failures go to the Houdini console *and* a log
+# file, so a failed style-pass isn't lost in the one-line status label.
+# --------------------------------------------------------------------------- #
+log = logging.getLogger("asset_forge")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _console = logging.StreamHandler()
+    _console.setFormatter(
+        logging.Formatter("[asset_forge] %(levelname)s: %(message)s"))
+    log.addHandler(_console)
+    log.propagate = False
+
+
+def _attach_log_file(inst: "hou.Node") -> Optional[str]:
+    """Attach a file handler writing to ``<collection>/vNNN/asset_forge.log`` once.
+
+    Idempotent — re-opening the panel won't stack duplicate handlers. Returns the
+    log path, or ``None`` if it couldn't be set up."""
+    try:
+        path = os.path.join(os.path.dirname(layout_dir(inst)), "asset_forge.log")
+    except Exception:
+        return None
+    target = os.path.abspath(path)
+    for h in log.handlers:
+        if isinstance(h, logging.FileHandler) \
+                and os.path.abspath(getattr(h, "baseFilename", "")) == target:
+            return path
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fh = logging.FileHandler(target)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(fh)
+    except Exception:
+        log.exception("could not open log file at %s", target)
+        return None
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -232,13 +273,16 @@ ASSET_CAMS = {
 CAMERA_PRESETS = list(ASSET_CAMS)        # combo order; [0] is the default
 DEFAULT_CAM = CAMERA_PRESETS[0]          # "Isometric" (the rig's standing cam)
 
-# CONTEXT segmented switch → the instance geo to solo in the Scene Viewer.
-# Each context shows its own geo (others among the three are hidden; unrelated
-# geos like Assets/Proxy are left untouched).
-CONTEXT_GEO = {
-    "layout":    "Layout",
-    "blockout":  "Centered",
-    "generated": "Generated",
+# CONTEXT segmented switch → the input index of the Display node's `switch1`.
+# Display soloing via display flags is impossible inside a locked HDA, so the
+# HDA instead carries a `display_node` int parm wired to `Display/switch1`
+# (input = ch("../../display_node")). The objmerges feed the switch in this
+# order — Layout=0, Blockout/Centered=1, Generated=2 — so the UI just sets the
+# parm and the switch picks the matching geo.
+CONTEXT_INDEX = {
+    "layout":    0,
+    "blockout":  1,
+    "generated": 2,
 }
 
 
@@ -299,24 +343,19 @@ def save_asset_state(asset_dir: str, **updates) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Viewport solo (show only the Layout geo; restore on panel close)
+# Context display (drive the Display node's switch via the HDA `display_node`
+# parm — works on a locked HDA, where display flags can't be set)
 # --------------------------------------------------------------------------- #
-def _solo_layout(inst: hou.Node) -> dict:
-    """Display only the Layout geo within the instance; return prior flags."""
-    layout = inst.node("Layout")
-    prev: dict = {}
-    for child in inst.children():
-        if child.type().name() == "geo" and hasattr(child, "setDisplayFlag"):
-            prev[child.path()] = child.isDisplayFlagSet()
-            child.setDisplayFlag(child.path() == layout.path())
-    return prev
-
-
-def _restore_solo(prev: dict) -> None:
-    for path, state in prev.items():
-        nd = hou.node(path)
-        if nd:
-            nd.setDisplayFlag(state)
+def _set_display_context(inst: hou.Node, mode: str) -> None:
+    """Show the geo for ``mode`` in the viewport by setting the instance's
+    ``display_node`` parm, which drives ``Display/switch1``. No-op if the mode
+    is unknown or the parm is missing (older HDA without the switch wiring)."""
+    idx = CONTEXT_INDEX.get(mode)
+    if idx is None:
+        return
+    p = inst.parm("display_node")
+    if p is not None:
+        p.set(idx)
 
 
 def _asset_forge_scene_viewer() -> "Optional[hou.SceneViewer]":
@@ -528,8 +567,12 @@ class _AssetGenWorker(QtCore.QObject):
                     if os.path.isfile(out):
                         self.candidate_done.emit(asset_id, i, out)
                     else:
+                        log.error("nano_banana produced no file — asset=%s "
+                                  "candidate=%d → %s", asset_id, i, out)
                         self.failed.emit(asset_id, i, "no file produced")
                 except Exception as exc:
+                    log.exception("nano_banana failed — asset=%s candidate=%d",
+                                  asset_id, i)
                     self.failed.emit(asset_id, i, str(exc))
         self.finished.emit()
 
@@ -1188,7 +1231,10 @@ class AssetCard(QtWidgets.QFrame):
         save_asset_state(self._dir, **updates)
 
     def _on_include(self, state: int) -> None:
-        on = state == QtCore.Qt.Checked
+        # Read the widget directly — comparing the signal's arg against
+        # QtCore.Qt.Checked is unreliable under PySide6's enum system (int vs
+        # Qt.CheckState), which silently saved include=False even when ticked.
+        on = self._incl.isChecked()
         self._save(include=on)
         self.setProperty("included", on)
         self._restyle()
@@ -1254,9 +1300,8 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._worker: Optional[_GenWorker] = None
         self._candidates: list[str] = []
 
-        # Solo the Layout geo; restore when this widget is destroyed.
-        prev = _solo_layout(inst)
-        self.destroyed.connect(lambda *_: _restore_solo(prev))
+        # Show the Layout geo in the viewport (drives Display/switch1).
+        _set_display_context(inst, "layout")
 
         self._build()
 
@@ -1495,6 +1540,7 @@ class AssetsWidget(QtWidgets.QWidget):
         self._active_dialog: Optional["ResultsViewerDialog"] = None
         self._gen_total = 0
         self._gen_done = 0
+        self._log_path = _attach_log_file(inst)
         self._build()
 
     def _build(self) -> None:
@@ -1614,15 +1660,9 @@ class AssetsWidget(QtWidgets.QWidget):
             _drive_viewport_camera(_layout_cam(self._inst))
 
     def _drive_context_geo(self, mode: str) -> None:
-        """Solo the instance geo matching the context (Layout/Centered/Generated);
-        the other two context geos are hidden, unrelated geos left as-is."""
-        target = CONTEXT_GEO.get(mode)
-        if not target:
-            return
-        for nm in CONTEXT_GEO.values():
-            nd = self._inst.node(nm)
-            if nd is not None and hasattr(nd, "setDisplayFlag"):
-                nd.setDisplayFlag(nm == target)
+        """Show the geo matching the context (Layout/Blockout/Generated) by
+        driving the HDA's ``display_node`` parm → ``Display/switch1``."""
+        _set_display_context(self._inst, mode)
 
     def _on_select_asset(self, asset_id: str) -> None:
         self._active_asset_id = asset_id
@@ -1707,6 +1747,8 @@ class AssetsWidget(QtWidgets.QWidget):
             return
         node = self._inst.node("Asset_Forge/Render_Previews")
         if node is None:
+            log.error("Render Preview: Render_Previews TOP node not found under %s",
+                      self._inst.path())
             self._assets_status.setText("Render_Previews TOP node not found")
             return
         self._set_busy(True)
@@ -1716,6 +1758,7 @@ class AssetsWidget(QtWidgets.QWidget):
             node.cookWorkItems(block=False)
         except Exception as exc:
             self._set_busy(False)
+            log.exception("Render Preview: cook failed")
             self._assets_status.setText("cook failed: %s" % exc)
             return
         self._poll_cook(node.getPDGGraphContext())
@@ -1772,12 +1815,21 @@ class AssetsWidget(QtWidgets.QWidget):
             prompt = _expand_prompt(tmpl, _attr_map(self._inst, a))
             jobs.append((a.get("id", ""), adir, in_path, prompt, count))
         if not jobs:
-            self._assets_status.setText(
-                "no previews to generate from — Render Preview first")
+            if not assets:
+                why = "no assets have 'incl.' ticked"
+            else:
+                why = ("%d included asset(s), but none have a preview.jpg yet "
+                       "— Render Preview first" % len(assets))
+            msg = "nothing to generate — " + why
+            log.warning("Generate Selected: %s", msg)
+            self._assets_status.setText(msg)
             return
         self._gen_total = sum(j[4] for j in jobs)
         self._gen_done = 0
         self._set_busy(True)
+        log.info("Generate Selected: %d asset(s), %d image(s)%s",
+                 len(jobs), self._gen_total,
+                 " (skipped %d w/o preview)" % skipped if skipped else "")
         msg = "generating 0/%d…" % self._gen_total
         if skipped:
             msg += "  (skipped %d w/o preview)" % skipped
@@ -1804,6 +1856,8 @@ class AssetsWidget(QtWidgets.QWidget):
 
     def _on_asset_failed(self, asset_id: str, index: int, msg: str) -> None:
         self._gen_done += 1
+        log.error("generation failed — asset=%s candidate=%d: %s",
+                  asset_id, index, msg)
         self._assets_status.setText("gen failed (%s #%d): %s" % (asset_id, index, msg))
 
     def _on_gen_finished(self) -> None:
@@ -1812,6 +1866,7 @@ class AssetsWidget(QtWidgets.QWidget):
         self._gen_thread = None
         self._gen_worker = None
         self._set_busy(False)
+        log.info("Generate Selected finished — %s", self._status_summary())
         self._assets_status.setText("done — " + self._status_summary())
 
 
