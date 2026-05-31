@@ -24,7 +24,9 @@ asset_forge_ui.launch(kwargs['node'])``) or the Python Shell
 
 from __future__ import annotations
 
+import filecmp
 import json
+import logging
 import os
 import re
 import shutil
@@ -47,6 +49,46 @@ if TOOLS_DIR not in sys.path:
 # Path of the instance the most recent launch targeted — read by the panel
 # factories when the Python Panel system instantiates a stage widget.
 _ACTIVE_INSTANCE: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# Logging — Generate / Render failures go to the Houdini console *and* a log
+# file, so a failed style-pass isn't lost in the one-line status label.
+# --------------------------------------------------------------------------- #
+log = logging.getLogger("asset_forge")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _console = logging.StreamHandler()
+    _console.setFormatter(
+        logging.Formatter("[asset_forge] %(levelname)s: %(message)s"))
+    log.addHandler(_console)
+    log.propagate = False
+
+
+def _attach_log_file(inst: "hou.Node") -> Optional[str]:
+    """Attach a file handler writing to ``<collection>/vNNN/asset_forge.log`` once.
+
+    Idempotent — re-opening the panel won't stack duplicate handlers. Returns the
+    log path, or ``None`` if it couldn't be set up."""
+    try:
+        path = os.path.join(os.path.dirname(layout_dir(inst)), "asset_forge.log")
+    except Exception:
+        return None
+    target = os.path.abspath(path)
+    for h in log.handlers:
+        if isinstance(h, logging.FileHandler) \
+                and os.path.abspath(getattr(h, "baseFilename", "")) == target:
+            return path
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fh = logging.FileHandler(target)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(fh)
+    except Exception:
+        log.exception("could not open log file at %s", target)
+        return None
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +252,10 @@ def asset_keeper_path(asset_dir: str) -> str:
     return os.path.join(asset_dir, "generated.png")
 
 
+def asset_mesh_path(asset_dir: str) -> str:
+    return os.path.join(asset_dir, "mesh.glb")
+
+
 def asset_candidate_path(asset_dir: str, index: int) -> str:
     return os.path.join(asset_dir, "gen_%02d.png" % index)
 
@@ -232,13 +278,16 @@ ASSET_CAMS = {
 CAMERA_PRESETS = list(ASSET_CAMS)        # combo order; [0] is the default
 DEFAULT_CAM = CAMERA_PRESETS[0]          # "Isometric" (the rig's standing cam)
 
-# CONTEXT segmented switch → the instance geo to solo in the Scene Viewer.
-# Each context shows its own geo (others among the three are hidden; unrelated
-# geos like Assets/Proxy are left untouched).
-CONTEXT_GEO = {
-    "layout":    "Layout",
-    "blockout":  "Centered",
-    "generated": "Generated",
+# CONTEXT segmented switch → the input index of the Display node's `switch1`.
+# Display soloing via display flags is impossible inside a locked HDA, so the
+# HDA instead carries a `display_node` int parm wired to `Display/switch1`
+# (input = ch("../../display_node")). The objmerges feed the switch in this
+# order — Layout=0, Blockout/Centered=1, Generated=2 — so the UI just sets the
+# parm and the switch picks the matching geo.
+CONTEXT_INDEX = {
+    "layout":    0,
+    "blockout":  1,
+    "generated": 2,
 }
 
 
@@ -249,6 +298,16 @@ def asset_candidates(asset_dir: str) -> "list[str]":
     return [os.path.join(asset_dir, f)
             for f in sorted(os.listdir(asset_dir))
             if f.startswith("gen_") and f.lower().endswith(".png")]
+
+
+def asset_result_path(asset_dir: str) -> Optional[str]:
+    """The 3D-pipeline result image for the Generated (3D) context — the rendered
+    model (``render.jpg``), falling back to the contact sheet, else ``None``."""
+    for name in ("render.jpg", "contactsheet.png"):
+        p = os.path.join(asset_dir, name)
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def asset_thumb_path(asset_dir: str, mode: str) -> Optional[str]:
@@ -298,25 +357,37 @@ def save_asset_state(asset_dir: str, **updates) -> None:
         json.dump(data, fh, indent=2)
 
 
-# --------------------------------------------------------------------------- #
-# Viewport solo (show only the Layout geo; restore on panel close)
-# --------------------------------------------------------------------------- #
-def _solo_layout(inst: hou.Node) -> dict:
-    """Display only the Layout geo within the instance; return prior flags."""
-    layout = inst.node("Layout")
-    prev: dict = {}
-    for child in inst.children():
-        if child.type().name() == "geo" and hasattr(child, "setDisplayFlag"):
-            prev[child.path()] = child.isDisplayFlagSet()
-            child.setDisplayFlag(child.path() == layout.path())
-    return prev
+def record_generation(asset_dir: str, filename: str, **meta) -> None:
+    """Trace what produced a candidate: merge ``meta`` under
+    ``data["generations"][filename]`` in the asset's ``data.json``.
+
+    Keyed by the candidate's basename (e.g. ``gen_01.png``) so each image carries
+    the exact prompt/model/ref that made it. Lives at top level (not under
+    ``ui``) — it's pipeline provenance, not editable UI state."""
+    os.makedirs(asset_dir, exist_ok=True)
+    data = load_asset_state(asset_dir)
+    gens = dict(data.get("generations", {}))
+    gens[filename] = meta
+    data["generations"] = gens
+    path = os.path.join(asset_dir, "data.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
 
 
-def _restore_solo(prev: dict) -> None:
-    for path, state in prev.items():
-        nd = hou.node(path)
-        if nd:
-            nd.setDisplayFlag(state)
+# --------------------------------------------------------------------------- #
+# Context display (drive the Display node's switch via the HDA `display_node`
+# parm — works on a locked HDA, where display flags can't be set)
+# --------------------------------------------------------------------------- #
+def _set_display_context(inst: hou.Node, mode: str) -> None:
+    """Show the geo for ``mode`` in the viewport by setting the instance's
+    ``display_node`` parm, which drives ``Display/switch1``. No-op if the mode
+    is unknown or the parm is missing (older HDA without the switch wiring)."""
+    idx = CONTEXT_INDEX.get(mode)
+    if idx is None:
+        return
+    p = inst.parm("display_node")
+    if p is not None:
+        p.set(idx)
 
 
 def _asset_forge_scene_viewer() -> "Optional[hou.SceneViewer]":
@@ -455,6 +526,35 @@ def select_work_item(inst: hou.Node, asset_name: str) -> bool:
     return False
 
 
+def ensure_work_items(inst: hou.Node) -> int:
+    """Populate the per-asset work items so card selection / work-item filtering
+    works the moment the UI opens.
+
+    ``generateStaticWorkItems`` yields nothing here — the JSON Input TOP only
+    emits items during a *cook* — so we cook the cheap ``load_assets → Resolver``
+    branch (a JSON read + the path-authoring python processor; no AI, no render)
+    to materialise the ``@name`` items that :func:`select_work_item` matches on.
+    No-op if items already exist or ``assets.json`` isn't ready. Returns the
+    resulting item count. Must run on the GUI thread (Houdini cooking isn't
+    thread-safe)."""
+    top = inst.node("Asset_Forge")
+    if top is None:
+        return 0
+    res = top.node("Resolver")
+    if res is None:
+        return 0
+    pdg = res.getPDGNode()
+    if pdg is not None and pdg.workItems:
+        return len(pdg.workItems)          # already cooked — don't redo the work
+    try:
+        res.cookWorkItems(block=True)       # cheap branch → safe to block briefly
+    except Exception:
+        log.exception("ensure_work_items: Resolver branch cook failed")
+        return 0
+    pdg = res.getPDGNode()
+    return len(pdg.workItems) if pdg is not None else 0
+
+
 # --------------------------------------------------------------------------- #
 # Generation worker (runs off the GUI thread)
 # --------------------------------------------------------------------------- #
@@ -502,19 +602,26 @@ class _AssetGenWorker(QtCore.QObject):
     style pass over its pre-rendered ``preview.jpg``. Emits per candidate so the
     owning card refreshes as ``gen_*.png`` land. Same threading split as
     :class:`_GenWorker`: network/file work here, all node cooking stays on the GUI
-    thread (the previews are rendered before this worker starts)."""
+    thread (the previews are rendered before this worker starts).
+
+    When ``ref_image`` is set (the collection's layout image) it is passed to
+    nano_banana as the style reference alongside each asset's clay preview. The
+    prompt text is used verbatim — no hidden additions."""
 
     candidate_done = QtCore.Signal(str, int, str)   # asset_id, index, out_path
     failed = QtCore.Signal(str, int, str)           # asset_id, index, message
     finished = QtCore.Signal()
 
-    def __init__(self, jobs: "list[tuple]", model: str) -> None:
+    def __init__(self, jobs: "list[tuple]", model: str,
+                 ref_image: "str | None" = None) -> None:
         super().__init__()
         self._jobs = jobs
         self._model = model
+        self._ref_image = ref_image
 
     def run(self) -> None:
         import importlib
+        import datetime
         import nano_banana_client
         importlib.reload(nano_banana_client)
         for asset_id, adir, in_path, prompt, count in self._jobs:
@@ -523,14 +630,79 @@ class _AssetGenWorker(QtCore.QObject):
                 try:
                     nano_banana_client.generate_image(
                         in_path, out, prompt,
+                        ref_image_path=self._ref_image,
                         model=self._model or None, verbose=False,
                     )
                     if os.path.isfile(out):
+                        # Trace what made this candidate, keyed by filename.
+                        record_generation(
+                            adir, os.path.basename(out),
+                            prompt=prompt,
+                            model=self._model or nano_banana_client.MODEL,
+                            layout_ref=self._ref_image or "",
+                            timestamp=datetime.datetime.now().isoformat(
+                                timespec="seconds"),
+                        )
                         self.candidate_done.emit(asset_id, i, out)
                     else:
+                        log.error("nano_banana produced no file — asset=%s "
+                                  "candidate=%d → %s", asset_id, i, out)
                         self.failed.emit(asset_id, i, "no file produced")
                 except Exception as exc:
+                    log.exception("nano_banana failed — asset=%s candidate=%d",
+                                  asset_id, i)
                     self.failed.emit(asset_id, i, str(exc))
+        self.finished.emit()
+
+
+class _MeshyWorker(QtCore.QObject):
+    """Submit each asset's kept ``generated.png`` to Meshy image-to-3D, off the
+    GUI thread, and download the resulting ``mesh.glb`` per asset.
+
+    Jobs are ``(asset_id, in_png, out_glb)``. Already-existing glbs are skipped
+    (no re-billing). Submits all pending tasks, then polls them in one shared loop
+    (``meshy_client.poll_all``) so they process in parallel. Emits per asset so the
+    owning widget can track progress; ``finished`` fires once all are settled,
+    which is the caller's cue to cook ``Render_Generated``."""
+
+    mesh_done = QtCore.Signal(str, str)   # asset_id, glb_path
+    failed = QtCore.Signal(str, str)      # asset_id, message
+    finished = QtCore.Signal()
+
+    def __init__(self, jobs: "list[tuple]") -> None:
+        super().__init__()
+        self._jobs = jobs
+
+    def run(self) -> None:
+        import importlib
+        import meshy_client
+        try:
+            importlib.reload(meshy_client)
+        except Exception:
+            pass
+        tasks = []   # (task_id, out_glb, asset_id) for the shared poll loop
+        for asset_id, in_png, out_glb in self._jobs:
+            if os.path.isfile(out_glb):
+                self.mesh_done.emit(asset_id, out_glb)   # cached — skip
+                continue
+            try:
+                tid = meshy_client.submit(in_png, verbose=False)
+                tasks.append((tid, out_glb, asset_id))
+            except Exception as exc:
+                log.exception("Meshy submit failed — asset=%s", asset_id)
+                self.failed.emit(asset_id, str(exc))
+        if tasks:
+            try:
+                meshy_client.poll_all([(t, o) for t, o, _ in tasks], verbose=False)
+            except Exception:
+                log.exception("Meshy poll_all error")
+            # Report per task by what actually landed on disk (poll_all aborts on
+            # the first failure, so check each rather than trust the return).
+            for _, out_glb, asset_id in tasks:
+                if os.path.isfile(out_glb):
+                    self.mesh_done.emit(asset_id, out_glb)
+                else:
+                    self.failed.emit(asset_id, "no glb produced")
         self.finished.emit()
 
 
@@ -766,6 +938,7 @@ class ResultsViewerDialog(QtWidgets.QDialog):
 
     def __init__(self, title: str, subtitle: str, candidates: "list[str]",
                  asset_dir: str, on_keeper=None, on_generate_more=None,
+                 read_only: bool = False,
                  parent: Optional["QtWidgets.QWidget"] = None) -> None:
         super().__init__(parent)
         self.setObjectName("picker")
@@ -778,6 +951,7 @@ class ResultsViewerDialog(QtWidgets.QDialog):
         self._asset_dir = asset_dir
         self._on_keeper = on_keeper
         self._on_generate_more_cb = on_generate_more
+        self._read_only = read_only
         self._focused: Optional[int] = None
         self._keeper = self._initial_keeper()
         self._build()
@@ -824,6 +998,9 @@ class ResultsViewerDialog(QtWidgets.QDialog):
         close_btn.clicked.connect(self.accept)
         for b in (self._back_btn, more_btn, self._keep_btn, close_btn):
             tl.addWidget(b)
+        if self._read_only:                       # render view — no keep/re-roll
+            more_btn.hide()
+            self._keep_btn.hide()
         root.addWidget(top)
 
         self._hint = QtWidgets.QLabel("")
@@ -953,6 +1130,8 @@ class ResultsViewerDialog(QtWidgets.QDialog):
 
     # -- actions ---------------------------------------------------------- #
     def _on_set_keeper(self) -> None:
+        if self._read_only:                       # render view — no keeper
+            return
         idx = self._focused if self._focused is not None else self._keeper
         if idx is None or not self._cands:
             return
@@ -1067,6 +1246,7 @@ class AssetCard(QtWidgets.QFrame):
         il.setSpacing(2)
         name_row = QtWidgets.QHBoxLayout()
         name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(6)          # gap so the idle "·" glyph doesn't read as ".name"
         self._status_icon = _status_icon(self._status())
         name_row.addWidget(self._status_icon)
         name = QtWidgets.QLabel(self._asset.get("name", self._asset.get("id", "?")))
@@ -1093,13 +1273,20 @@ class AssetCard(QtWidgets.QFrame):
         if cam_val in CAMERA_PRESETS:
             self._cam.setCurrentText(cam_val)
         self._cam.currentTextChanged.connect(self._on_cam_change)
-        cl.addWidget(_labeled_compact("CAMERA", self._cam))
+        self._cam_box = _labeled_compact("CAMERA", self._cam)
+        cl.addWidget(self._cam_box)
         self._var = QtWidgets.QSpinBox()
         self._var.setRange(1, 8)
         self._var.setValue(int(self._state.get(
             "variations", self._asset.get("variations", 4))))
         self._var.valueChanged.connect(lambda v: self._save(variations=v))
-        cl.addWidget(_labeled_compact("VAR", self._var))
+        self._var_box = _labeled_compact("VAR", self._var)
+        cl.addWidget(self._var_box)
+        # In the Generated (3D) context the camera/variations don't apply — a note
+        # stands in for the dropdown, and only the include checkbox stays live.
+        self._note = QtWidgets.QLabel("→ 3D pipeline")
+        self._note.setStyleSheet("color:%s;font-size:10px;" % THEME["text_muted"])
+        cl.addWidget(self._note)
         self._incl = QtWidgets.QCheckBox("incl.")
         self._incl.setChecked(bool(self._state.get("include", True)))
         self._incl.stateChanged.connect(self._on_include)
@@ -1131,6 +1318,7 @@ class AssetCard(QtWidgets.QFrame):
         grid.setColumnStretch(1, 1)
         self._refresh_thumb()
         self._refresh_results()
+        self._apply_mode_controls()
 
     def _meta_text(self) -> str:
         return "showing: %s   ·   %s" % (self._mode, self._status_text())
@@ -1147,8 +1335,32 @@ class AssetCard(QtWidgets.QFrame):
             self._thumb.setStyleSheet(
                 "color:%s;font-size:9px;" % THEME["text_muted"])
 
+    def _apply_mode_controls(self) -> None:
+        """Generated (3D) context drops the camera + variations controls (they
+        don't apply to the mesh step) and shows the ``→ 3D pipeline`` note;
+        every other context keeps the camera/variations workflow."""
+        is_3d = self._mode == "generated"
+        self._cam_box.setVisible(not is_3d)
+        self._var_box.setVisible(not is_3d)
+        self._note.setVisible(is_3d)
+
     def _refresh_results(self) -> None:
         _clear_layout(self._results_lay)
+        # Generated (3D) context: a single 3D-render result, not the gen_*.png set.
+        if self._mode == "generated":
+            rp = asset_result_path(self._dir)
+            if rp:
+                t = _ClickableLabel()
+                t.setObjectName("resultThumb")
+                t.setFixedSize(40, 40)
+                t.setPixmap(_scaled_pixmap(rp, 40, 40))
+                self._results_lay.addWidget(t)
+            else:
+                ph = QtWidgets.QLabel("—")
+                ph.setStyleSheet("color:%s;" % THEME["muted_2"])
+                self._results_lay.addWidget(ph)
+            self._results_lay.addStretch(1)
+            return
         cands = asset_candidates(self._dir)[: self._RESULT_CAP]
         keeper_name = self._state.get("keeper")
         if not cands:
@@ -1177,6 +1389,8 @@ class AssetCard(QtWidgets.QFrame):
         self._mode = mode
         self._meta.setText(self._meta_text())
         self._refresh_thumb()
+        self._refresh_results()
+        self._apply_mode_controls()
 
     def set_active(self, active: bool) -> None:
         self.setProperty("active", active)
@@ -1188,7 +1402,10 @@ class AssetCard(QtWidgets.QFrame):
         save_asset_state(self._dir, **updates)
 
     def _on_include(self, state: int) -> None:
-        on = state == QtCore.Qt.Checked
+        # Read the widget directly — comparing the signal's arg against
+        # QtCore.Qt.Checked is unreliable under PySide6's enum system (int vs
+        # Qt.CheckState), which silently saved include=False even when ticked.
+        on = self._incl.isChecked()
         self._save(include=on)
         self.setProperty("included", on)
         self._restyle()
@@ -1218,7 +1435,7 @@ class AssetCard(QtWidgets.QFrame):
 
     def _open_picker(self) -> None:
         if self._on_open_picker:
-            self._on_open_picker(self._asset, self.refresh)
+            self._on_open_picker(self._asset, self.refresh, self._mode)
 
     def mousePressEvent(self, ev: "QtGui.QMouseEvent") -> None:
         self._emit_select()
@@ -1239,6 +1456,48 @@ def _labeled_compact(label: str, widget: "QtWidgets.QWidget") -> "QtWidgets.QWid
     return box
 
 
+class _LayoutResultsViewer(ResultsViewerDialog):
+    """The Results Viewer, retargeted at the *layout* generations.
+
+    Same grid / primary-focus / filmstrip UX as the per-asset picker, but the
+    keeper is the layout's ``layout_generated.png`` (no per-asset ``data.json``):
+    keeper detection and ``Set Keeper`` go through the layout paths. Picking a
+    candidate here makes it the active layout, then fires ``on_keeper`` so the
+    Layout panel re-highlights its grid to match."""
+
+    def __init__(self, inst: hou.Node, candidates: "list[str]",
+                 on_keeper=None,
+                 parent: Optional["QtWidgets.QWidget"] = None) -> None:
+        self._inst = inst            # set before super().__init__ → _initial_keeper
+        super().__init__("Layout", "generations", candidates,
+                         layout_dir(inst), on_keeper=on_keeper, parent=parent)
+
+    def _initial_keeper(self) -> Optional[int]:
+        """The keeper is whichever candidate's bytes match layout_generated.png."""
+        gen = generated_path(self._inst)
+        if os.path.isfile(gen):
+            for i, p in enumerate(self._cands):
+                try:
+                    if filecmp.cmp(gen, p, shallow=False):
+                        return i
+                except OSError:
+                    pass
+        return None
+
+    def _on_set_keeper(self) -> None:
+        idx = self._focused if self._focused is not None else self._keeper
+        if idx is None or not self._cands:
+            return
+        dst = generated_path(self._inst)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(self._cands[idx], dst)
+        self._keeper = idx
+        if self._on_keeper:
+            self._on_keeper()
+        (self._show_focus(self._focused) if self._focused is not None
+         else self._show_grid())
+
+
 # --------------------------------------------------------------------------- #
 # Layout panel — framing, preview render, layout generation.
 # A standalone Python Panel widget (dock it where you like, e.g. top-right).
@@ -1253,10 +1512,10 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[_GenWorker] = None
         self._candidates: list[str] = []
+        self._thumbs: "list[_ClickableLabel]" = []   # parallel to _candidates
 
-        # Solo the Layout geo; restore when this widget is destroyed.
-        prev = _solo_layout(inst)
-        self.destroyed.connect(lambda *_: _restore_solo(prev))
+        # Show the Layout geo in the viewport (drives Display/switch1).
+        _set_display_context(inst, "layout")
 
         self._build()
 
@@ -1320,8 +1579,14 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._preview_label = QtWidgets.QLabel("no preview yet")
         self._preview_label.setObjectName("previewLabel")
         self._preview_label.setAlignment(QtCore.Qt.AlignCenter)
-        self._preview_label.setMinimumHeight(220)
-        sec.addWidget(self._preview_label)
+        self._preview_label.setMinimumHeight(120)
+        self._preview_label.setFixedWidth(self._PREVIEW_W)
+        # Half-size render preview — centred via stretches, doesn't dominate.
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self._preview_label)
+        row.addStretch(1)
+        sec.addLayout(row)
         return sec
 
     def _build_generation(self) -> "Section":
@@ -1346,6 +1611,12 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._gen_btn = QtWidgets.QPushButton("Generate")
         self._gen_btn.clicked.connect(self._on_generate)
         ctl.addWidget(self._gen_btn, 1)
+        # One Expand button for the whole set → opens the Results Viewer with
+        # every layout generation; picking one there makes it the active layout.
+        self._expand_btn = QtWidgets.QPushButton("⤢ Expand")
+        self._expand_btn.setToolTip("Open all generations in the Results Viewer")
+        self._expand_btn.clicked.connect(self._open_results)
+        ctl.addWidget(self._expand_btn)
         sec.addLayout(ctl)
 
         self._gallery = QtWidgets.QGridLayout()
@@ -1375,16 +1646,15 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._refresh_preview()
         self._status.setText("rendered %s" % os.path.basename(out))
 
-    def _img_width(self) -> int:
-        """Shared display width for the render preview and candidate previews."""
-        return max(self._preview_label.width(), 420)
+    # Display width of the render preview (~half the panel). Candidate thumbs
+    # are sized separately by _THUMB_W / _THUMB_H in the 2-row gallery.
+    _PREVIEW_W = 360
 
     def _refresh_preview(self) -> None:
         path = preview_path(self._inst)
         if os.path.isfile(path):
-            pix = QtGui.QPixmap(path).scaledToWidth(
-                self._img_width(), QtCore.Qt.SmoothTransformation)
-            self._preview_label.setPixmap(pix)
+            self._preview_label.setPixmap(
+                _scaled_pixmap(path, self._PREVIEW_W))
         else:
             self._preview_label.setText("no preview yet")
 
@@ -1413,22 +1683,59 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         self._worker.finished.connect(self._on_gen_finished)
         self._thread.start()
 
-    _GALLERY_COLS = 1
+    # 4 columns → up to 8 candidates wrap into 2 rows. Thumbs are small;
+    # full quality is one click away via the per-cell Expand button.
+    _GALLERY_COLS = 4
+    _THUMB_W = 150
+    _THUMB_H = 110
 
     def _add_thumb(self, path: str) -> None:
-        """Append a full-size clickable preview (matches the render preview)."""
-        lab = _ClickableLabel()
-        lab.setObjectName("thumb")
-        lab.setAlignment(QtCore.Qt.AlignCenter)
-        lab.setCursor(QtCore.Qt.PointingHandCursor)
-        lab.setToolTip("Click to select → layout_generated.png")
-        lab.setPixmap(QtGui.QPixmap(path).scaledToWidth(
-            self._img_width(), QtCore.Qt.SmoothTransformation))
-        lab.clicked.connect(lambda p=path: self._select(p))
+        """Append a small, selectable candidate thumbnail to the 2-row gallery.
+
+        Click the thumb → select it (copies to ``layout_generated.png`` and
+        highlights it like a per-asset keeper). The shared ``⤢ Expand`` button
+        opens all of them in the Results Viewer."""
+        thumb = _ClickableLabel()
+        thumb.setObjectName("resultThumb")        # reuses the keeper-border QSS
+        thumb.setProperty("keeper", False)
+        thumb.setAlignment(QtCore.Qt.AlignCenter)
+        thumb.setCursor(QtCore.Qt.PointingHandCursor)
+        thumb.setFixedSize(self._THUMB_W, self._THUMB_H)
+        thumb.setToolTip("Click to select → layout_generated.png")
+        thumb.setPixmap(_scaled_pixmap(path, self._THUMB_W, self._THUMB_H))
+        thumb.clicked.connect(lambda p=path: self._select(p))
+
         slot = len(self._candidates)
         self._candidates.append(path)
-        self._gallery.addWidget(lab, slot // self._GALLERY_COLS,
+        self._thumbs.append(thumb)
+        self._gallery.addWidget(thumb, slot // self._GALLERY_COLS,
                                 slot % self._GALLERY_COLS)
+        self._update_expand_btn()
+
+    def _open_results(self) -> None:
+        """Open the Results Viewer with every layout generation. Picking one
+        there sets the active layout and re-highlights the panel grid."""
+        if not self._candidates:
+            self._status.setText("nothing to expand — generate first")
+            return
+        _LayoutResultsViewer(self._inst, list(self._candidates),
+                             on_keeper=self._on_viewer_keeper, parent=self).exec()
+
+    def _on_viewer_keeper(self) -> None:
+        """The viewer set a new active layout — sync the panel grid highlight."""
+        self._mark_current_keeper()
+        self._refresh_preview()
+
+    def _update_expand_btn(self) -> None:
+        if hasattr(self, "_expand_btn"):
+            self._expand_btn.setEnabled(bool(self._candidates))
+
+    def _highlight_selected(self, path: Optional[str]) -> None:
+        """Mark the chosen thumb with the keeper border, clear the rest."""
+        for thumb, cand in zip(self._thumbs, self._candidates):
+            thumb.setProperty("keeper", cand == path)
+            thumb.style().unpolish(thumb)
+            thumb.style().polish(thumb)
 
     def _load_existing_candidates(self) -> None:
         """Repopulate the gallery from layout_gen_*.png on disk (persists across
@@ -1443,6 +1750,23 @@ class LayoutControlsWidget(QtWidgets.QWidget):
         if files:
             self._status.setText("%d existing generation(s) — click one to keep"
                                  % len(files))
+            self._mark_current_keeper()
+
+    def _mark_current_keeper(self) -> None:
+        """Highlight the thumb whose bytes match ``layout_generated.png`` (the
+        keeper is a copy, so match by content rather than a stored name).
+        Clears any stale highlight if nothing matches."""
+        gen = generated_path(self._inst)
+        match = None
+        if os.path.isfile(gen):
+            for cand in self._candidates:
+                try:
+                    if filecmp.cmp(gen, cand, shallow=False):
+                        match = cand
+                        break
+                except OSError:
+                    pass
+        self._highlight_selected(match)
 
     def _on_candidate(self, index: int, path: str) -> None:
         self._add_thumb(path)
@@ -1464,15 +1788,18 @@ class LayoutControlsWidget(QtWidgets.QWidget):
     def _select(self, path: str) -> None:
         dst = generated_path(self._inst)
         shutil.copyfile(path, dst)
+        self._highlight_selected(path)
         self._status.setText("selected → %s" % os.path.basename(dst))
 
     def _clear_gallery(self) -> None:
         self._candidates = []
+        self._thumbs = []
         while self._gallery.count():
             item = self._gallery.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
+        self._update_expand_btn()
 
 
 # --------------------------------------------------------------------------- #
@@ -1492,9 +1819,12 @@ class AssetsWidget(QtWidgets.QWidget):
         self._active_asset_id: Optional[str] = None
         self._gen_thread: Optional[QtCore.QThread] = None
         self._gen_worker: Optional[_AssetGenWorker] = None
+        self._meshy_thread: Optional[QtCore.QThread] = None
+        self._meshy_worker: Optional[_MeshyWorker] = None
         self._active_dialog: Optional["ResultsViewerDialog"] = None
         self._gen_total = 0
         self._gen_done = 0
+        self._log_path = _attach_log_file(inst)
         self._build()
 
     def _build(self) -> None:
@@ -1561,8 +1891,30 @@ class AssetsWidget(QtWidgets.QWidget):
         self._render_btn.clicked.connect(self._on_render_preview)
         self._gen_sel_btn = QtWidgets.QPushButton("Generate Selected")
         self._gen_sel_btn.clicked.connect(self._on_generate_selected)
+        # Step 3: send each included asset's kept generated.png to Meshy, then
+        # cook Render_Generated (textures → USD → render) once the meshes are in.
+        self._send3d_btn = QtWidgets.QPushButton("Send to 3D")
+        self._send3d_btn.clicked.connect(self._on_send_to_3d)
+        # Step 4: cook the contact sheet (preview | generated | render) per asset.
+        self._contact_btn = QtWidgets.QPushButton("Render Contact Sheet")
+        self._contact_btn.clicked.connect(self._on_render_contactsheet)
         row.addWidget(self._render_btn)
         row.addWidget(self._gen_sel_btn)
+        row.addWidget(self._send3d_btn)
+        row.addWidget(self._contact_btn)
+
+        # Feed the collection's kept layout image (layout_generated.png) into each
+        # per-asset nano_banana call as the master style reference, so every asset
+        # picks up one unified look. Disabled until a layout image exists.
+        self._use_layout_ref = QtWidgets.QCheckBox("Layout style ref")
+        has_layout = os.path.isfile(generated_path(self._inst))
+        self._use_layout_ref.setChecked(has_layout)
+        self._use_layout_ref.setEnabled(has_layout)
+        self._use_layout_ref.setToolTip(
+            "Use layout_generated.png as the style reference for every asset"
+            if has_layout else
+            "No layout_generated.png yet — generate/keep a layout image first")
+        row.addWidget(self._use_layout_ref)
         row.addStretch(1)
         self._assets_status = QtWidgets.QLabel(self._status_summary())
         self._assets_status.setObjectName("status")
@@ -1590,6 +1942,11 @@ class AssetsWidget(QtWidgets.QWidget):
             self._cards_lay.addWidget(card)
             self._cards.append(card)
 
+        # On launch, activate the first asset so its work item is filtered and the
+        # viewport frames its saved camera (mirrors clicking the first card).
+        if self._cards and self._active_asset_id is None:
+            self._on_select_asset(self._cards[0].asset_id())
+
     def _status_summary(self) -> str:
         assets = load_assets(self._inst)
         done = sum(1 for a in assets
@@ -1609,20 +1966,19 @@ class AssetsWidget(QtWidgets.QWidget):
         for c in self._cards:
             c.set_mode(mode)
         self._drive_context_geo(mode)
-        # Layout context frames the whole scene through the ortho layout cam.
+        # Layout context frames the whole scene through the ortho layout cam;
+        # asset contexts frame the active asset through its saved camera.
         if mode == "layout":
             _drive_viewport_camera(_layout_cam(self._inst))
+        elif self._active_asset_id is not None:
+            card = self._card_by_id(self._active_asset_id)
+            if card is not None:
+                self._drive_camera(card.camera_preset())
 
     def _drive_context_geo(self, mode: str) -> None:
-        """Solo the instance geo matching the context (Layout/Centered/Generated);
-        the other two context geos are hidden, unrelated geos left as-is."""
-        target = CONTEXT_GEO.get(mode)
-        if not target:
-            return
-        for nm in CONTEXT_GEO.values():
-            nd = self._inst.node(nm)
-            if nd is not None and hasattr(nd, "setDisplayFlag"):
-                nd.setDisplayFlag(nm == target)
+        """Show the geo matching the context (Layout/Blockout/Generated) by
+        driving the HDA's ``display_node`` parm → ``Display/switch1``."""
+        _set_display_context(self._inst, mode)
 
     def _on_select_asset(self, asset_id: str) -> None:
         self._active_asset_id = asset_id
@@ -1635,8 +1991,11 @@ class AssetsWidget(QtWidgets.QWidget):
                 select_work_item(self._inst, card.asset_name())
             except Exception:
                 pass
-            # Frame the selected asset through its saved camera preset.
-            self._drive_camera(card.camera_preset())
+            # Frame the asset through its saved camera — but only in an asset
+            # context; layout context keeps the ortho overview (and avoids a
+            # launch-time race with the layout-cam pin in launch()).
+            if self._mode != "layout":
+                self._drive_camera(card.camera_preset())
 
     def _on_card_camera(self, asset_id: str, preset: str) -> None:
         """A card's CAMERA dropdown changed. If that card isn't active, select it
@@ -1652,16 +2011,24 @@ class AssetsWidget(QtWidgets.QWidget):
         cam_node = self._inst.node(ASSET_CAMS.get(preset, ASSET_CAMS[DEFAULT_CAM]))
         _drive_viewport_camera(cam_node)
 
-    def _open_asset_picker(self, asset: dict, on_keeper) -> None:
+    def _open_asset_picker(self, asset: dict, on_keeper, mode: str = "blockout") -> None:
         adir = asset_dir_of(asset)
         name = asset.get("name", asset.get("id", "?"))
         cam = load_asset_state(adir).get("ui", {}).get("camera", "—")
-        sub = "/obj/assets/%s · cam: %s" % (name, cam)
-        dlg = ResultsViewerDialog(
-            name, sub, asset_candidates(adir), adir,
-            on_keeper=lambda: (on_keeper(), self._refresh_assets_status()),
-            on_generate_more=lambda a=asset: self._start_generation([a]),
-            parent=self)
+        # Generated (3D) context: view the rendered model (render.jpg), not the
+        # gen_*.png style candidates. Read-only — keeper/generate-more don't apply.
+        if mode == "generated":
+            rp = asset_result_path(adir)
+            dlg = ResultsViewerDialog(
+                name, "/obj/assets/%s · 3D render" % name,
+                [rp] if rp else [], adir, read_only=True, parent=self)
+        else:
+            dlg = ResultsViewerDialog(
+                name, "/obj/assets/%s · cam: %s" % (name, cam),
+                asset_candidates(adir), adir,
+                on_keeper=lambda: (on_keeper(), self._refresh_assets_status()),
+                on_generate_more=lambda a=asset: self._start_generation([a]),
+                parent=self)
         # Tracked so candidate signals can live-refresh the open picker.
         self._active_dialog = dlg
         try:
@@ -1691,7 +2058,9 @@ class AssetsWidget(QtWidgets.QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         for b in (getattr(self, "_render_btn", None),
-                  getattr(self, "_gen_sel_btn", None)):
+                  getattr(self, "_gen_sel_btn", None),
+                  getattr(self, "_send3d_btn", None),
+                  getattr(self, "_contact_btn", None)):
             if b is not None:
                 b.setEnabled(not busy)
 
@@ -1707,6 +2076,8 @@ class AssetsWidget(QtWidgets.QWidget):
             return
         node = self._inst.node("Asset_Forge/Render_Previews")
         if node is None:
+            log.error("Render Preview: Render_Previews TOP node not found under %s",
+                      self._inst.path())
             self._assets_status.setText("Render_Previews TOP node not found")
             return
         self._set_busy(True)
@@ -1716,13 +2087,45 @@ class AssetsWidget(QtWidgets.QWidget):
             node.cookWorkItems(block=False)
         except Exception as exc:
             self._set_busy(False)
+            log.exception("Render Preview: cook failed")
             self._assets_status.setText("cook failed: %s" % exc)
             return
         self._poll_cook(node.getPDGGraphContext())
 
-    def _poll_cook(self, gc) -> None:
-        """Watch a PDG graph context cook; refresh cards + jump to Blockout when
-        it finishes. Uses a GUI-thread QTimer (PDG events fire off-thread)."""
+    # -- step 4: cook the per-asset contact sheets (Render_ContactSheet) ---- #
+    def _on_render_contactsheet(self) -> None:
+        """Cook the ``Render_ContactSheet`` TOP node of this HDA instance, which
+        assembles each asset's preview | generated | render into a contact sheet.
+        Resolved relative to the instance (multi-instance safe). Non-blocking —
+        a QTimer polls the graph context and refreshes the cards on completion."""
+        if self._gen_thread is not None or self._meshy_thread is not None \
+                or getattr(self, "_cook_timer", None):
+            return
+        node = self._inst.node("Asset_Forge/Render_ContactSheet")
+        if node is None:
+            log.error("Render Contact Sheet: Render_ContactSheet TOP node not "
+                      "found under %s", self._inst.path())
+            self._assets_status.setText("Render_ContactSheet node not found")
+            return
+        self._set_busy(True)
+        self._assets_status.setText("cooking Render_ContactSheet…")
+        QtWidgets.QApplication.processEvents()
+        try:
+            node.cookWorkItems(block=False)
+        except Exception as exc:
+            self._set_busy(False)
+            log.exception("Render Contact Sheet: cook failed")
+            self._assets_status.setText("cook failed: %s" % exc)
+            return
+        self._poll_cook(node.getPDGGraphContext(), on_done_context=self._mode,
+                        done_msg="contact sheets complete")
+
+    def _poll_cook(self, gc, on_done_context: str = "blockout",
+                   on_done=None,
+                   done_msg: str = "Render_Previews cook complete") -> None:
+        """Watch a PDG graph context cook; on completion run ``on_done`` (e.g. to
+        restore temporarily-changed parms), refresh the cards, and switch to
+        ``on_done_context``. Uses a GUI-thread QTimer (PDG events fire off-thread)."""
         self._cook_timer = QtCore.QTimer(self)
         self._cook_timer.setInterval(400)
         state = {"started": bool(gc.cooking), "idle": 0}
@@ -1738,15 +2141,84 @@ class AssetsWidget(QtWidgets.QWidget):
                     return
             self._cook_timer.stop()
             self._cook_timer = None
+            if on_done is not None:
+                on_done()
             self._set_busy(False)
             for c in self._cards:
                 c.refresh()
-            # Jump to Blockout so the freshly rendered clay previews are visible.
-            self._set_context("blockout")
-            self._assets_status.setText("Render_Previews cook complete")
+            self._set_context(on_done_context)
+            self._assets_status.setText(done_msg)
 
         self._cook_timer.timeout.connect(_poll)
         self._cook_timer.start()
+
+    # -- step 3: Send to 3D = Meshy mesh-gen, then cook Render_Generated ------- #
+    def _on_send_to_3d(self) -> None:
+        """Two steps for every *included* asset: (1) send its kept
+        ``generated.png`` to Meshy off the GUI thread → ``mesh.glb``; (2) once all
+        meshes are in, cook ``Render_Generated`` (textures → USD → render.jpg)."""
+        if self._gen_thread is not None or self._meshy_thread is not None \
+                or getattr(self, "_cook_timer", None):
+            return
+        if self._inst.node("Asset_Forge/Render_Generated") is None:
+            self._assets_status.setText("Render_Generated node not found")
+            return
+        jobs, skipped = [], 0
+        for a in self._included_assets():
+            adir = asset_dir_of(a)
+            in_png = asset_keeper_path(adir)
+            if not os.path.isfile(in_png):
+                skipped += 1
+                continue
+            jobs.append((a.get("id", ""), in_png, asset_mesh_path(adir)))
+        if not jobs:
+            self._assets_status.setText(
+                "nothing to send — included assets need a kept generated.png")
+            return
+
+        self._meshy_total, self._meshy_done = len(jobs), 0
+        self._set_busy(True)
+        self._assets_status.setText("Meshy 0/%d…" % self._meshy_total)
+        self._meshy_thread = QtCore.QThread()
+        self._meshy_worker = _MeshyWorker(jobs)
+        self._meshy_worker.moveToThread(self._meshy_thread)
+        self._meshy_thread.started.connect(self._meshy_worker.run)
+        self._meshy_worker.mesh_done.connect(self._on_mesh_done)
+        self._meshy_worker.failed.connect(self._on_mesh_failed)
+        self._meshy_worker.finished.connect(self._on_meshy_finished)
+        self._meshy_thread.start()
+
+    def _on_mesh_done(self, asset_id: str, path: str) -> None:
+        self._meshy_done += 1
+        self._assets_status.setText(
+            "Meshy %d/%d…" % (self._meshy_done, self._meshy_total))
+
+    def _on_mesh_failed(self, asset_id: str, msg: str) -> None:
+        log.error("Meshy failed — asset=%s: %s", asset_id, msg)
+        self._assets_status.setText("Meshy failed (%s): %s" % (asset_id, msg))
+
+    def _on_meshy_finished(self) -> None:
+        self._meshy_thread.quit()
+        self._meshy_thread.wait()
+        self._meshy_thread = None
+        self._meshy_worker = None
+        # Step 2: meshes are in — cook Render_Generated (textures → USD → render).
+        node = self._inst.node("Asset_Forge/Render_Generated")
+        if node is None:
+            self._set_busy(False)
+            self._assets_status.setText("Render_Generated node not found")
+            return
+        self._assets_status.setText("meshes ready — rendering…")
+        QtWidgets.QApplication.processEvents()
+        try:
+            node.cookWorkItems(block=False)
+        except Exception as exc:
+            self._set_busy(False)
+            log.exception("Render Generated: cook failed")
+            self._assets_status.setText("cook failed: %s" % exc)
+            return
+        self._poll_cook(node.getPDGGraphContext(), on_done_context="generated",
+                        done_msg="3D render complete")
 
     # -- step 2: style-pass the previews (nano_banana) ------------------- #
     def _on_generate_selected(self) -> None:
@@ -1772,19 +2244,33 @@ class AssetsWidget(QtWidgets.QWidget):
             prompt = _expand_prompt(tmpl, _attr_map(self._inst, a))
             jobs.append((a.get("id", ""), adir, in_path, prompt, count))
         if not jobs:
-            self._assets_status.setText(
-                "no previews to generate from — Render Preview first")
+            if not assets:
+                why = "no assets have 'incl.' ticked"
+            else:
+                why = ("%d included asset(s), but none have a preview.jpg yet "
+                       "— Render Preview first" % len(assets))
+            msg = "nothing to generate — " + why
+            log.warning("Generate Selected: %s", msg)
+            self._assets_status.setText(msg)
             return
         self._gen_total = sum(j[4] for j in jobs)
         self._gen_done = 0
         self._set_busy(True)
+        log.info("Generate Selected: %d asset(s), %d image(s)%s",
+                 len(jobs), self._gen_total,
+                 " (skipped %d w/o preview)" % skipped if skipped else "")
         msg = "generating 0/%d…" % self._gen_total
         if skipped:
             msg += "  (skipped %d w/o preview)" % skipped
         self._assets_status.setText(msg)
 
+        # One collection-wide style reference shared by every asset's style pass.
+        ref = generated_path(self._inst)
+        if not (self._use_layout_ref.isChecked() and os.path.isfile(ref)):
+            ref = None
+
         self._gen_thread = QtCore.QThread()
-        self._gen_worker = _AssetGenWorker(jobs, model)
+        self._gen_worker = _AssetGenWorker(jobs, model, ref)
         self._gen_worker.moveToThread(self._gen_thread)
         self._gen_thread.started.connect(self._gen_worker.run)
         self._gen_worker.candidate_done.connect(self._on_asset_candidate)
@@ -1804,6 +2290,8 @@ class AssetsWidget(QtWidgets.QWidget):
 
     def _on_asset_failed(self, asset_id: str, index: int, msg: str) -> None:
         self._gen_done += 1
+        log.error("generation failed — asset=%s candidate=%d: %s",
+                  asset_id, index, msg)
         self._assets_status.setText("gen failed (%s #%d): %s" % (asset_id, index, msg))
 
     def _on_gen_finished(self) -> None:
@@ -1812,6 +2300,7 @@ class AssetsWidget(QtWidgets.QWidget):
         self._gen_thread = None
         self._gen_worker = None
         self._set_busy(False)
+        log.info("Generate Selected finished — %s", self._status_summary())
         self._assets_status.setText("done — " + self._status_summary())
 
 
@@ -1876,6 +2365,9 @@ def launch(node: Optional[hou.Node] = None) -> "hou.FloatingPanel":
     global _ACTIVE_INSTANCE
     inst = find_instance(node)
     _ACTIVE_INSTANCE = inst.path()
+    # Materialise per-asset work items up front so clicking a card can drive the
+    # viewport's work-item filtering — without them setSelectedWorkItem is a no-op.
+    ensure_work_items(inst)
     _ensure_interfaces_installed()
 
     # Don't stack panels on repeated launches.
