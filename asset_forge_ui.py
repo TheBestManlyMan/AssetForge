@@ -494,6 +494,35 @@ def select_work_item(inst: hou.Node, asset_name: str) -> bool:
     return False
 
 
+def ensure_work_items(inst: hou.Node) -> int:
+    """Populate the per-asset work items so card selection / work-item filtering
+    works the moment the UI opens.
+
+    ``generateStaticWorkItems`` yields nothing here — the JSON Input TOP only
+    emits items during a *cook* — so we cook the cheap ``load_assets → Resolver``
+    branch (a JSON read + the path-authoring python processor; no AI, no render)
+    to materialise the ``@name`` items that :func:`select_work_item` matches on.
+    No-op if items already exist or ``assets.json`` isn't ready. Returns the
+    resulting item count. Must run on the GUI thread (Houdini cooking isn't
+    thread-safe)."""
+    top = inst.node("Asset_Forge")
+    if top is None:
+        return 0
+    res = top.node("Resolver")
+    if res is None:
+        return 0
+    pdg = res.getPDGNode()
+    if pdg is not None and pdg.workItems:
+        return len(pdg.workItems)          # already cooked — don't redo the work
+    try:
+        res.cookWorkItems(block=True)       # cheap branch → safe to block briefly
+    except Exception:
+        log.exception("ensure_work_items: Resolver branch cook failed")
+        return 0
+    pdg = res.getPDGNode()
+    return len(pdg.workItems) if pdg is not None else 0
+
+
 # --------------------------------------------------------------------------- #
 # Generation worker (runs off the GUI thread)
 # --------------------------------------------------------------------------- #
@@ -1636,6 +1665,11 @@ class AssetsWidget(QtWidgets.QWidget):
             self._cards_lay.addWidget(card)
             self._cards.append(card)
 
+        # On launch, activate the first asset so its work item is filtered and the
+        # viewport frames its saved camera (mirrors clicking the first card).
+        if self._cards and self._active_asset_id is None:
+            self._on_select_asset(self._cards[0].asset_id())
+
     def _status_summary(self) -> str:
         assets = load_assets(self._inst)
         done = sum(1 for a in assets
@@ -1655,9 +1689,14 @@ class AssetsWidget(QtWidgets.QWidget):
         for c in self._cards:
             c.set_mode(mode)
         self._drive_context_geo(mode)
-        # Layout context frames the whole scene through the ortho layout cam.
+        # Layout context frames the whole scene through the ortho layout cam;
+        # asset contexts frame the active asset through its saved camera.
         if mode == "layout":
             _drive_viewport_camera(_layout_cam(self._inst))
+        elif self._active_asset_id is not None:
+            card = self._card_by_id(self._active_asset_id)
+            if card is not None:
+                self._drive_camera(card.camera_preset())
 
     def _drive_context_geo(self, mode: str) -> None:
         """Show the geo matching the context (Layout/Blockout/Generated) by
@@ -1675,8 +1714,11 @@ class AssetsWidget(QtWidgets.QWidget):
                 select_work_item(self._inst, card.asset_name())
             except Exception:
                 pass
-            # Frame the selected asset through its saved camera preset.
-            self._drive_camera(card.camera_preset())
+            # Frame the asset through its saved camera — but only in an asset
+            # context; layout context keeps the ortho overview (and avoids a
+            # launch-time race with the layout-cam pin in launch()).
+            if self._mode != "layout":
+                self._drive_camera(card.camera_preset())
 
     def _on_card_camera(self, asset_id: str, preset: str) -> None:
         """A card's CAMERA dropdown changed. If that card isn't active, select it
@@ -1931,6 +1973,9 @@ def launch(node: Optional[hou.Node] = None) -> "hou.FloatingPanel":
     global _ACTIVE_INSTANCE
     inst = find_instance(node)
     _ACTIVE_INSTANCE = inst.path()
+    # Materialise per-asset work items up front so clicking a card can drive the
+    # viewport's work-item filtering — without them setSelectedWorkItem is a no-op.
+    ensure_work_items(inst)
     _ensure_interfaces_installed()
 
     # Don't stack panels on repeated launches.
